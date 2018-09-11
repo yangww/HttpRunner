@@ -1,40 +1,16 @@
 # encoding: utf-8
 
 import copy
-import csv
-import hashlib
-import hmac
-import imp
-import importlib
 import io
+import itertools
 import json
 import os.path
-import random
-import re
 import string
-import types
 from datetime import datetime
 
-import yaml
-from httprunner import exception, logger
-from httprunner.compat import OrderedDict, is_py2, is_py3
-from requests.structures import CaseInsensitiveDict
+from httprunner import exceptions, logger
+from httprunner.compat import OrderedDict, basestring, is_py2
 
-SECRET_KEY = "DebugTalk"
-
-
-def gen_random_string(str_len):
-    return ''.join(
-        random.choice(string.ascii_letters + string.digits) for _ in range(str_len))
-
-def gen_md5(*str_args):
-    return hashlib.md5("".join(str_args).encode('utf-8')).hexdigest()
-
-def get_sign(*args):
-    content = ''.join(args).encode('ascii')
-    sign_key = SECRET_KEY.encode('ascii')
-    sign = hmac.new(sign_key, content, hashlib.sha1).hexdigest()
-    return sign
 
 def remove_prefix(text, prefix):
     """ remove prefix from text
@@ -44,135 +20,17 @@ def remove_prefix(text, prefix):
     return text
 
 
-class FileUtils(object):
-
-    @staticmethod
-    def _check_format(file_path, content):
-        """ check testcase format if valid
-        """
-        if not content:
-            # testcase file content is empty
-            err_msg = u"Testcase file content is empty: {}".format(file_path)
-            logger.log_error(err_msg)
-            raise exception.FileFormatError(err_msg)
-
-        elif not isinstance(content, (list, dict)):
-            # testcase file content does not match testcase format
-            err_msg = u"Testcase file content format invalid: {}".format(file_path)
-            logger.log_error(err_msg)
-            raise exception.FileFormatError(err_msg)
-
-    @staticmethod
-    def _load_yaml_file(yaml_file):
-        """ load yaml file and check file content format
-        """
-        with io.open(yaml_file, 'r', encoding='utf-8') as stream:
-            yaml_content = yaml.load(stream)
-            FileUtils._check_format(yaml_file, yaml_content)
-            return yaml_content
-
-    @staticmethod
-    def _load_json_file(json_file):
-        """ load json file and check file content format
-        """
-        with io.open(json_file, encoding='utf-8') as data_file:
-            try:
-                json_content = json.load(data_file)
-            except exception.JSONDecodeError:
-                err_msg = u"JSONDecodeError: JSON file format error: {}".format(json_file)
-                logger.log_error(err_msg)
-                raise exception.FileFormatError(err_msg)
-
-            FileUtils._check_format(json_file, json_content)
-            return json_content
-
-    @staticmethod
-    def _load_csv_file(csv_file):
-        """ load csv file and check file content format
-        @param
-            csv_file: csv file path
-            e.g. csv file content:
-                username,password
-                test1,111111
-                test2,222222
-                test3,333333
-        @return
-            list of parameter, each parameter is in dict format
-            e.g.
-            [
-                {'username': 'test1', 'password': '111111'},
-                {'username': 'test2', 'password': '222222'},
-                {'username': 'test3', 'password': '333333'}
-            ]
-        """
-        csv_content_list = []
-
-        with io.open(csv_file, encoding='utf-8') as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                csv_content_list.append(row)
-
-        return csv_content_list
-
-    @staticmethod
-    def load_file(file_path):
-        if not os.path.isfile(file_path):
-            raise exception.FileNotFoundError("{} does not exist.".format(file_path))
-
-        file_suffix = os.path.splitext(file_path)[1].lower()
-        if file_suffix == '.json':
-            return FileUtils._load_json_file(file_path)
-        elif file_suffix in ['.yaml', '.yml']:
-            return FileUtils._load_yaml_file(file_path)
-        elif file_suffix == ".csv":
-            return FileUtils._load_csv_file(file_path)
-        else:
-            # '' or other suffix
-            err_msg = u"Unsupported file format: {}".format(file_path)
-            logger.log_warning(err_msg)
-            return []
-
-    @staticmethod
-    def load_folder_files(folder_path, recursive=True):
-        """ load folder path, return all files in list format.
-        @param
-            folder_path: specified folder path to load
-            recursive: if True, will load files recursively
-        """
-        if isinstance(folder_path, (list, set)):
-            files = []
-            for path in set(folder_path):
-                files.extend(FileUtils.load_folder_files(path, recursive))
-
-            return files
-
-        if not os.path.exists(folder_path):
-            return []
-
-        file_list = []
-
-        for dirpath, dirnames, filenames in os.walk(folder_path):
-            filenames_list = []
-
-            for filename in filenames:
-                if not filename.endswith(('.yml', '.yaml', '.json')):
-                    continue
-
-                filenames_list.append(filename)
-
-            for filename in filenames_list:
-                file_path = os.path.join(dirpath, filename)
-                file_list.append(file_path)
-
-            if not recursive:
-                break
-
-        return file_list
+def set_os_environ(variables_mapping):
+    """ set variables mapping to os.environ
+    """
+    for variable in variables_mapping:
+        os.environ[variable] = variables_mapping[variable]
+        logger.log_debug("Loaded variable: {}".format(variable))
 
 
 def query_json(json_content, query, delimiter='.'):
     """ Do an xpath-like query with json_content.
-    @param (json_content) json_content
+    @param (dict/list/string) json_content
         json_content = {
             "ids": [1, 2, 3, 4],
             "person": {
@@ -186,25 +44,33 @@ def query_json(json_content, query, delimiter='.'):
         }
     @param (str) query
         "person.name.first_name"  =>  "Leo"
+        "person.name.first_name.0"  =>  "L"
         "person.cities.0"         =>  "Guangzhou"
     @return queried result
     """
-    if json_content == "":
-        raise exception.ResponseError("response content is empty!")
-
+    raise_flag = False
+    response_body = u"response body: {}\n".format(json_content)
     try:
         for key in query.split(delimiter):
-            if isinstance(json_content, list):
+            if isinstance(json_content, (list, basestring)):
                 json_content = json_content[int(key)]
-            elif isinstance(json_content, (dict, CaseInsensitiveDict)):
+            elif isinstance(json_content, dict):
                 json_content = json_content[key]
             else:
-                raise exception.ParseResponseError(
-                    "response content is in text format! failed to query key {}!".format(key))
+                logger.log_error(
+                    "invalid type value: {}({})".format(json_content, type(json_content)))
+                raise_flag = True
     except (KeyError, ValueError, IndexError):
-        raise exception.ParseResponseError("failed to query json when extracting response!")
+        raise_flag = True
+
+    if raise_flag:
+        err_msg = u"Failed to extract! => {}\n".format(query)
+        err_msg += response_body
+        logger.log_error(err_msg)
+        raise exceptions.ExtractFailure(err_msg)
 
     return json_content
+
 
 def get_uniform_comparator(comparator):
     """ convert comparator alias to uniform name
@@ -259,91 +125,34 @@ def deep_update_dict(origin_dict, override_dict):
 
     return origin_dict
 
-def is_function(tup):
-    """ Takes (name, object) tuple, returns True if it is a function.
-    """
-    name, item = tup
-    return isinstance(item, types.FunctionType)
-
-def is_variable(tup):
-    """ Takes (name, object) tuple, returns True if it is a variable.
-    """
-    name, item = tup
-    if callable(item):
-        # function or class
-        return False
-
-    if isinstance(item, types.ModuleType):
-        # imported module
-        return False
-
-    if name.startswith("_"):
-        # private property
-        return False
-
-    return True
-
-def get_imported_module(module_name):
-    """ import module and return imported module
-    """
-    return importlib.import_module(module_name)
-
-def get_imported_module_from_file(file_path):
-    """ import module from python file path and return imported module
-    """
-    if is_py3:
-        imported_module = importlib.machinery.SourceFileLoader(
-            'module_name', file_path).load_module()
-    elif is_py2:
-        imported_module = imp.load_source('module_name', file_path)
-    else:
-        raise RuntimeError("Neither Python 3 nor Python 2.")
-
-    return imported_module
-
-def filter_module(module, filter_type):
-    """ filter functions or variables from import module
-    @params
-        module: imported module
-        filter_type: "function" or "variable"
-    """
-    filter_type = is_function if filter_type == "function" else is_variable
-    module_functions_dict = dict(filter(filter_type, vars(module).items()))
-    return module_functions_dict
-
-def search_conf_item(start_path, item_type, item_name):
-    """ search expected function or variable recursive upward
-    @param
-        start_path: search start path
-        item_type: "function" or "variable"
-        item_name: function name or variable name
-    """
-    dir_path = os.path.dirname(os.path.abspath(start_path))
-    target_file = os.path.join(dir_path, "debugtalk.py")
-
-    if os.path.isfile(target_file):
-        imported_module = get_imported_module_from_file(target_file)
-        items_dict = filter_module(imported_module, item_type)
-        if item_name in items_dict:
-            return items_dict[item_name]
-        else:
-            return search_conf_item(dir_path, item_type, item_name)
-
-    if dir_path == start_path:
-        # system root path
-        err_msg = "{} not found in recursive upward path!".format(item_name)
-        if item_type == "function":
-            raise exception.FunctionNotFound(err_msg)
-        else:
-            raise exception.VariableNotFound(err_msg)
-
-    return search_conf_item(dir_path, item_type, item_name)
-
 def lower_dict_keys(origin_dict):
     """ convert keys in dict to lower case
-    e.g.
-        Name => name, Request => request
-        URL => url, METHOD => method, Headers => headers, Data => data
+
+    Args:
+        origin_dict (dict): mapping data structure
+
+    Returns:
+        dict: mapping with all keys lowered.
+
+    Examples:
+        >>> origin_dict = {
+            "Name": "",
+            "Request": "",
+            "URL": "",
+            "METHOD": "",
+            "Headers": "",
+            "Data": ""
+        }
+        >>> lower_dict_keys(origin_dict)
+            {
+                "name": "",
+                "request": "",
+                "url": "",
+                "method": "",
+                "headers": "",
+                "data": ""
+            }
+
     """
     if not origin_dict or not isinstance(origin_dict, dict):
         return origin_dict
@@ -353,60 +162,63 @@ def lower_dict_keys(origin_dict):
         for key, value in origin_dict.items()
     }
 
-def lower_config_dict_key(config_dict):
-    """ convert key in config dict to lower case, convertion will occur in three places:
-        1, all keys in config dict;
-        2, all keys in config["request"]
-        3, all keys in config["request"]["headers"]
+def lower_test_dict_keys(test_dict):
+    """ convert keys in test_dict to lower case, convertion will occur in two places:
+        1, all keys in test_dict;
+        2, all keys in test_dict["request"]
     """
-    # convert keys in config dict
-    config_dict = lower_dict_keys(config_dict)
+    # convert keys in test_dict
+    test_dict = lower_dict_keys(test_dict)
 
-    if "request" in config_dict:
-        # convert keys in config["request"]
-        config_dict["request"] = lower_dict_keys(config_dict["request"])
+    if "request" in test_dict:
+        # convert keys in test_dict["request"]
+        test_dict["request"] = lower_dict_keys(test_dict["request"])
 
-        # convert keys in config["request"]["headers"]
-        if "headers" in config_dict["request"]:
-            config_dict["request"]["headers"] = lower_dict_keys(config_dict["request"]["headers"])
+    return test_dict
 
-    return config_dict
+def convert_mappinglist_to_orderdict(mapping_list):
+    """ convert mapping list to ordered dict
 
-def convert_to_order_dict(map_list):
-    """ convert mapping in list to ordered dict
-    @param (list) map_list
-        [
-            {"a": 1},
-            {"b": 2}
-        ]
-    @return (OrderDict)
-        OrderDict({
-            "a": 1,
-            "b": 2
-        })
+    Args:
+        mapping_list (list):
+            [
+                {"a": 1},
+                {"b": 2}
+            ]
+
+    Returns:
+        OrderedDict: converted mapping in OrderedDict
+            OrderDict(
+                {
+                    "a": 1,
+                    "b": 2
+                }
+            )
+
     """
     ordered_dict = OrderedDict()
-    for map_dict in map_list:
+    for map_dict in mapping_list:
         ordered_dict.update(map_dict)
 
     return ordered_dict
 
+
 def update_ordered_dict(ordered_dict, override_mapping):
-    """ override ordered_dict with new mapping
-    @param
-        (OrderDict) ordered_dict
-            OrderDict({
-                "a": 1,
-                "b": 2
-            })
-        (dict) override_mapping
-            {"a": 3, "c": 4}
-    @return (OrderDict)
-        OrderDict({
-            "a": 3,
-            "b": 2,
-            "c": 4
-        })
+    """ override ordered_dict with new mapping.
+
+    Args:
+        ordered_dict (OrderDict): original ordered dict
+        override_mapping (dict): new variables mapping
+
+    Returns:
+        OrderDict: new overrided variables mapping.
+
+    Examples:
+        >>> ordered_dict = OrderDict({"a": 1, "b": 2})
+        >>> override_mapping = {"a": 3, "c": 4}
+        >>> update_ordered_dict(ordered_dict, override_mapping)
+            OrderDict({"a": 3, "b": 2, "c": 4})
+
     """
     new_ordered_dict = copy.copy(ordered_dict)
     for var, value in override_mapping.items():
@@ -414,33 +226,115 @@ def update_ordered_dict(ordered_dict, override_mapping):
 
     return new_ordered_dict
 
-def override_variables_binds(variables, new_mapping):
-    """ convert variables in testcase to ordered mapping, with new_mapping overrided
+
+def override_mapping_list(variables, new_mapping):
+    """ override variables with new mapping.
+
+    Args:
+        variables (list): variables list
+            [
+                {"var_a": 1},
+                {"var_b": "world"}
+            ]
+        new_mapping (dict): overrided variables mapping
+            {
+                "var_a": "hello"
+            }
+
+    Returns:
+        OrderedDict: overrided variables mapping.
+
+    Examples:
+        >>> variables = [
+                {"var_a": 1},
+                {"var_b": "world"}
+            ]
+        >>> new_mapping = {
+                "var_a": "hello"
+            }
+        >>> override_mapping_list(variables, new_mapping)
+            OrderedDict(
+                {
+                    "var_a": "hello",
+                    "var_b": "world"
+                }
+            )
+
     """
     if isinstance(variables, list):
-        variables_ordered_dict = convert_to_order_dict(variables)
+        variables_ordered_dict = convert_mappinglist_to_orderdict(variables)
     elif isinstance(variables, (OrderedDict, dict)):
         variables_ordered_dict = variables
     else:
-        raise exception.ParamsError("variables error!")
+        raise exceptions.ParamsError("variables error!")
 
     return update_ordered_dict(
         variables_ordered_dict,
         new_mapping
     )
 
-def print_output(outputs):
 
-    if not outputs:
-        return
+def get_testcase_io(testcase):
+    """ get testcase input(variables) and output.
 
+    Args:
+        testcase (unittest.suite.TestSuite): corresponding to one YAML/JSON file, it has been set two attributes:
+            config: parsed config block
+            runner: initialized runner.Runner() with config
+
+    Returns:
+        dict: input(variables) and output mapping.
+
+    """
+    runner = testcase.runner
+    variables = testcase.config.get("variables", [])
+    output_list = testcase.config.get("output", [])
+
+    return {
+        "in": dict(variables),
+        "out": runner.extract_output(output_list)
+    }
+
+
+def print_io(in_out):
+    """ print input(variables) and output.
+
+    Args:
+        in_out (dict): input(variables) and output mapping.
+
+    Examples:
+        >>> in_out = {
+                "in": {
+                    "var_a": "hello",
+                    "var_b": "world"
+                },
+                "out": {
+                    "status_code": 500
+                }
+            }
+        >>> print_io(in_out)
+        ================== Variables & Output ==================
+        Type   | Variable         :  Value
+        ------ | ---------------- :  ---------------------------
+        Var    | var_a            :  hello
+        Var    | var_b            :  world
+
+        Out    | status_code      :  500
+        --------------------------------------------------------
+
+    """
+    content_format = "{:<6} | {:<16} :  {:<}\n"
     content = "\n================== Variables & Output ==================\n"
-    content += '{:<6} | {:<16} :  {:<}\n'.format("Type", "Variable", "Value")
-    content += '{:<6} | {:<16} :  {:<}\n'.format("-" * 6, "-" * 16, "-" * 27)
+    content += content_format.format("Type", "Variable", "Value")
+    content += content_format.format("-" * 6, "-" * 16, "-" * 27)
 
     def prepare_content(var_type, in_out):
         content = ""
         for variable, value in in_out.items():
+            if isinstance(value, tuple):
+                continue
+            elif isinstance(value, (dict, list)):
+                value = json.dumps(value)
 
             if is_py2:
                 if isinstance(variable, unicode):
@@ -448,31 +342,30 @@ def print_output(outputs):
                 if isinstance(value, unicode):
                     value = value.encode("utf-8")
 
-            content += '{:<6} | {:<16} :  {:<}\n'.format(var_type, variable, value)
+            content += content_format.format(var_type, variable, value)
 
         return content
 
-    for output in outputs:
-        _in = output["in"]
-        _out = output["out"]
+    _in = in_out["in"]
+    _out = in_out["out"]
 
-        if not _out:
-            continue
-
-        content += prepare_content("Var", _in)
-        content += "\n"
-        content += prepare_content("Out", _out)
-        content += "-" * 56 + "\n"
+    content += prepare_content("Var", _in)
+    content += "\n"
+    content += prepare_content("Out", _out)
+    content += "-" * 56 + "\n"
 
     logger.log_debug(content)
 
-def create_scaffold(project_path):
-    if os.path.isdir(project_path):
-        folder_name = os.path.basename(project_path)
-        logger.log_warning(u"Folder {} exists, please specify a new folder name.".format(folder_name))
+
+def create_scaffold(project_name):
+    """ create scaffold with specified project name.
+    """
+    if os.path.isdir(project_name):
+        logger.log_warning(u"Folder {} exists, please specify a new folder name.".format(project_name))
         return
 
-    logger.color_print("Start to create new project: {}\n".format(project_path), "GREEN")
+    logger.color_print("Start to create new project: {}".format(project_name), "GREEN")
+    logger.color_print("CWD: {}\n".format(os.getcwd()), "BLUE")
 
     def create_path(path, ptype):
         if ptype == "folder":
@@ -480,42 +373,54 @@ def create_scaffold(project_path):
         elif ptype == "file":
             open(path, 'w').close()
 
-        return "created {}: {}\n".format(ptype, path)
+        msg = "created {}: {}".format(ptype, path)
+        logger.color_print(msg, "BLUE")
 
     path_list = [
-        (project_path, "folder"),
-        (os.path.join(project_path, "tests"), "folder"),
-        (os.path.join(project_path, "tests", "api"), "folder"),
-        (os.path.join(project_path, "tests", "suite"), "folder"),
-        (os.path.join(project_path, "tests", "testcases"), "folder"),
-        (os.path.join(project_path, "tests", "debugtalk.py"), "file")
+        (project_name, "folder"),
+        (os.path.join(project_name, "api"), "folder"),
+        (os.path.join(project_name, "testcases"), "folder"),
+        (os.path.join(project_name, "testsuites"), "folder"),
+        (os.path.join(project_name, "reports"), "folder"),
+        (os.path.join(project_name, "debugtalk.py"), "file"),
+        (os.path.join(project_name, ".env"), "file")
     ]
+    [create_path(p[0], p[1]) for p in path_list]
 
-    msg = ""
-    for p in path_list:
-        msg += create_path(p[0], p[1])
 
-    logger.color_print(msg, "BLUE")
-
-def load_dot_env_file(path):
-    """ load .env file and set to os.environ
+def gen_cartesian_product(*args):
+    """ generate cartesian product for lists
+    @param
+        (list) args
+            [{"a": 1}, {"a": 2}],
+            [
+                {"x": 111, "y": 112},
+                {"x": 121, "y": 122}
+            ]
+    @return
+        cartesian product in list
+        [
+            {'a': 1, 'x': 111, 'y': 112},
+            {'a': 1, 'x': 121, 'y': 122},
+            {'a': 2, 'x': 111, 'y': 112},
+            {'a': 2, 'x': 121, 'y': 122}
+        ]
     """
-    if not path:
-        path = os.path.join(os.getcwd(), ".env")
-        if not os.path.isfile(path):
-            logger.log_debug(".env file not exist: {}".format(path))
-            return
-    else:
-        if not os.path.isfile(path):
-            raise exception.FileNotFoundError("env file not exist: {}".format(path))
+    if not args:
+        return []
+    elif len(args) == 1:
+        return args[0]
 
-    logger.log_info("Loading environment variables from {}".format(path))
-    with io.open(path, 'r', encoding='utf-8') as fp:
-        for line in fp:
-            variable, value = line.split("=")
-            variable = variable.strip()
-            os.environ[variable] = value.strip()
-            logger.log_debug("Loaded variable: {}".format(variable))
+    product_list = []
+    for product_item_tuple in itertools.product(*args):
+        product_item_dict = {}
+        for item in product_item_tuple:
+            product_item_dict.update(item)
+
+        product_list.append(product_item_dict)
+
+    return product_list
+
 
 def validate_json_file(file_list):
     """ validate JSON testset format
@@ -534,6 +439,7 @@ def validate_json_file(file_list):
                 raise SystemExit(e)
 
         print("OK")
+
 
 def prettify_json_file(file_list):
     """ prettify JSON testset format
@@ -560,6 +466,7 @@ def prettify_json_file(file_list):
             out.write('\n')
 
         print("success: {}".format(outfile))
+
 
 def get_python2_retire_msg():
     retire_day = datetime(2020, 1, 1)

@@ -2,255 +2,149 @@ import os
 import time
 
 import requests
-from httprunner import exception, response, runner, testcase
-from httprunner.context import Context
-from httprunner.utils import FileUtils, gen_md5
+from httprunner import context, exceptions, loader, response
 from tests.base import ApiServerUnittest
 
 
-class VariableBindsUnittest(ApiServerUnittest):
+class TestContext(ApiServerUnittest):
 
     def setUp(self):
-        self.context = Context()
+        loader.load_project_tests(os.path.join(os.getcwd(), "tests"))
+        self.debugtalk_module = loader.project_mapping["debugtalk"]
+
+        self.context = context.Context(
+            self.debugtalk_module["variables"],
+            self.debugtalk_module["functions"]
+        )
         testcase_file_path = os.path.join(os.getcwd(), 'tests/data/demo_binds.yml')
-        self.testcases = FileUtils.load_file(testcase_file_path)
+        self.testcases = loader.load_file(testcase_file_path)
 
-    def test_context_init_functions(self):
-        self.assertIn("get_timestamp", self.context.testset_functions_config)
-        self.assertIn("gen_random_string", self.context.testset_functions_config)
+    def test_init_context_functions(self):
+        context_functions = self.context.TESTCASE_SHARED_FUNCTIONS_MAPPING
+        self.assertIn("gen_md5", context_functions)
+        self.assertIn("equals", context_functions)
 
+    def test_init_context_variables(self):
+        self.assertEqual(
+            self.context.teststep_variables_mapping["SECRET_KEY"],
+            "DebugTalk"
+        )
+        self.assertEqual(
+            self.context.testcase_runtime_variables_mapping["SECRET_KEY"],
+            "DebugTalk"
+        )
+
+    def test_update_context_testcase_level(self):
         variables = [
-            {"random": "${gen_random_string(5)}"},
-            {"timestamp10": "${get_timestamp(10)}"}
+            {"TOKEN": "debugtalk"},
+            {"data": '{"name": "user", "password": "123456"}'}
         ]
-        self.context.bind_variables(variables)
-        context_variables = self.context.testcase_variables_mapping
+        self.context.update_context_variables(variables, "testcase")
+        self.assertEqual(
+            self.context.teststep_variables_mapping["TOKEN"],
+            "debugtalk"
+        )
+        self.assertEqual(
+            self.context.testcase_runtime_variables_mapping["TOKEN"],
+            "debugtalk"
+        )
 
-        self.assertEqual(len(context_variables["random"]), 5)
-        self.assertEqual(len(context_variables["timestamp10"]), 10)
+    def test_update_context_teststep_level(self):
+        variables = [
+            {"TOKEN": "debugtalk"},
+            {"data": '{"name": "user", "password": "123456"}'}
+        ]
+        self.context.update_context_variables(variables, "teststep")
+        self.assertEqual(
+            self.context.teststep_variables_mapping["TOKEN"],
+            "debugtalk"
+        )
+        self.assertNotIn(
+            "TOKEN",
+            self.context.testcase_runtime_variables_mapping
+        )
 
-    def test_context_bind_testset_variables(self):
-        # testcase in JSON format
-        testcase1 = {
-            "variables": [
-                {"GLOBAL_TOKEN": "debugtalk"},
-                {"token": "$GLOBAL_TOKEN"}
-            ]
-        }
-        # testcase in YAML format
-        testcase2 = self.testcases["bind_variables"]
+    def test_eval_content_functions(self):
+        content = "${sleep_N_secs(1)}"
+        start_time = time.time()
+        self.context.eval_content(content)
+        elapsed_time = time.time() - start_time
+        self.assertGreater(elapsed_time, 1)
 
-        for testcase in [testcase1, testcase2]:
-            variables = testcase['variables']
-            self.context.bind_variables(variables, level="testset")
+    def test_eval_content_variables(self):
+        content = "abc$SECRET_KEY"
+        self.assertEqual(
+            self.context.eval_content(content),
+            "abcDebugTalk"
+        )
 
-            testset_variables = self.context.testset_shared_variables_mapping
-            testcase_variables = self.context.testcase_variables_mapping
-            self.assertIn("GLOBAL_TOKEN", testset_variables)
-            self.assertIn("GLOBAL_TOKEN", testcase_variables)
-            self.assertEqual(testset_variables["GLOBAL_TOKEN"], "debugtalk")
-            self.assertIn("token", testset_variables)
-            self.assertIn("token", testcase_variables)
-            self.assertEqual(testset_variables["token"], "debugtalk")
+        # TODO: fix variable extraction
+        # content = "abc$SECRET_KEYdef"
+        # self.assertEqual(
+        #     self.context.eval_content(content),
+        #     "abcDebugTalkdef"
+        # )
 
-    def test_context_bind_testcase_variables(self):
-        testcase1 = {
-            "variables": [
-                {"GLOBAL_TOKEN": "debugtalk"},
-                {"token": "$GLOBAL_TOKEN"}
-            ]
-        }
-        testcase2 = self.testcases["bind_variables"]
+    def test_update_testcase_runtime_variables_mapping(self):
+        variables = {"abc": 123}
+        self.context.update_testcase_runtime_variables_mapping(variables)
+        self.assertEqual(
+            self.context.testcase_runtime_variables_mapping["abc"],
+            123
+        )
+        self.assertEqual(
+            self.context.teststep_variables_mapping["abc"],
+            123
+        )
 
-        for testcase in [testcase1, testcase2]:
-            variables = testcase['variables']
-            self.context.bind_variables(variables)
-
-            testset_variables = self.context.testset_shared_variables_mapping
-            testcase_variables = self.context.testcase_variables_mapping
-            self.assertNotIn("GLOBAL_TOKEN", testset_variables)
-            self.assertIn("GLOBAL_TOKEN", testcase_variables)
-            self.assertEqual(testcase_variables["GLOBAL_TOKEN"], "debugtalk")
-            self.assertNotIn("token", testset_variables)
-            self.assertIn("token", testcase_variables)
-            self.assertEqual(testcase_variables["token"], "debugtalk")
-
-    def test_context_bind_lambda_functions(self):
-        testcase1 = {
-            "function_binds": {
-                "add_one": lambda x: x + 1,
-                "add_two_nums": lambda x, y: x + y
-            },
-            "variables": [
-                {"add1": "${add_one(2)}"},
-                {"sum2nums": "${add_two_nums(2,3)}"}
-            ]
-        }
-        testcase2 = self.testcases["bind_lambda_functions"]
-
-        for testcase in [testcase1, testcase2]:
-            function_binds = testcase.get('function_binds', {})
-            self.context.bind_functions(function_binds)
-
-            variables = testcase['variables']
-            self.context.bind_variables(variables)
-
-            context_variables = self.context.testcase_variables_mapping
-            self.assertIn("add1", context_variables)
-            self.assertEqual(context_variables["add1"], 3)
-            self.assertIn("sum2nums", context_variables)
-            self.assertEqual(context_variables["sum2nums"], 5)
-
-    def test_call_builtin_functions(self):
-        testcase1 = {
-            "variables": [
-                {"length": "${len(debugtalk)}"},
-                {"smallest": "${min(2, 3, 8)}"},
-                {"largest": "${max(2, 3, 8)}"}
-            ]
-        }
-        testcase2 = self.testcases["builtin_functions"]
-
-        for testcase in [testcase1, testcase2]:
-            variables = testcase['variables']
-            self.context.bind_variables(variables)
-
-            context_variables = self.context.testcase_variables_mapping
-            self.assertEqual(context_variables["length"], 9)
-            self.assertEqual(context_variables["smallest"], 2)
-            self.assertEqual(context_variables["largest"], 8)
-
-    def test_context_bind_lambda_functions_with_import(self):
-        testcase1 = {
-            "requires": ["random", "string", "hashlib"],
-            "function_binds": {
-                "gen_random_string": "lambda str_len: ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(str_len))",
-                "gen_md5": "lambda *str_args: hashlib.md5(''.join(str_args).encode('utf-8')).hexdigest()"
-            },
-            "variables": [
-                {"TOKEN": "debugtalk"},
-                {"random": "${gen_random_string(5)}"},
-                {"data": '{"name": "user", "password": "123456"}'},
-                {"authorization": "${gen_md5($TOKEN, $data, $random)}"}
-            ]
-        }
-        testcase2 = self.testcases["bind_lambda_functions_with_import"]
-
-        for testcase in [testcase1, testcase2]:
-            requires = testcase.get('requires', [])
-            self.context.import_requires(requires)
-
-            function_binds = testcase.get('function_binds', {})
-            self.context.bind_functions(function_binds)
-
-            variables = testcase['variables']
-            self.context.bind_variables(variables)
-            context_variables = self.context.testcase_variables_mapping
-
-            self.assertIn("TOKEN", context_variables)
-            TOKEN = context_variables["TOKEN"]
-            self.assertEqual(TOKEN, "debugtalk")
-            self.assertIn("random", context_variables)
-            self.assertIsInstance(context_variables["random"], str)
-            self.assertEqual(len(context_variables["random"]), 5)
-            random = context_variables["random"]
-            self.assertIn("data", context_variables)
-            data = context_variables["data"]
-            self.assertIn("authorization", context_variables)
-            self.assertEqual(len(context_variables["authorization"]), 32)
-            authorization = context_variables["authorization"]
-            self.assertEqual(gen_md5(TOKEN, data, random), authorization)
-
-    def test_import_module_items(self):
-        testcase1 = {
-            "import_module_items": ["tests.debugtalk"],
-            "variables": [
-                {"TOKEN": "debugtalk"},
-                {"random": "${gen_random_string(5)}"},
-                {"data": '{"name": "user", "password": "123456"}'},
-                {"authorization": "${gen_md5($TOKEN, $data, $random)}"}
-            ]
-        }
-        testcase2 = self.testcases["bind_module_functions"]
-
-        for testcase in [testcase1, testcase2]:
-            module_items = testcase.get('import_module_items', [])
-            self.context.import_module_items(module_items)
-
-            variables = testcase['variables']
-            self.context.bind_variables(variables)
-            context_variables = self.context.testcase_variables_mapping
-
-            self.assertIn("TOKEN", context_variables)
-            TOKEN = context_variables["TOKEN"]
-            self.assertEqual(TOKEN, "debugtalk")
-            self.assertIn("random", context_variables)
-            self.assertIsInstance(context_variables["random"], str)
-            self.assertEqual(len(context_variables["random"]), 5)
-            random = context_variables["random"]
-            self.assertIn("data", context_variables)
-            data = context_variables["data"]
-            self.assertIn("authorization", context_variables)
-            self.assertEqual(len(context_variables["authorization"]), 32)
-            authorization = context_variables["authorization"]
-            self.assertEqual(gen_md5(TOKEN, data, random), authorization)
-            self.assertIn("SECRET_KEY", context_variables)
-            SECRET_KEY = context_variables["SECRET_KEY"]
-            self.assertEqual(SECRET_KEY, "DebugTalk")
+    def test_update_teststep_variables_mapping(self):
+        self.context.update_teststep_variables_mapping("abc", 123)
+        self.assertEqual(
+            self.context.teststep_variables_mapping["abc"],
+            123
+        )
+        self.assertNotIn(
+            "abc",
+            self.context.testcase_runtime_variables_mapping
+        )
 
     def test_get_parsed_request(self):
-        test_runner = runner.Runner()
-        testcase = {
-            "import_module_items": ["tests.debugtalk"],
-            "variables": [
-                {"TOKEN": "debugtalk"},
-                {"random": "${gen_random_string(5)}"},
-                {"data": '{"name": "user", "password": "123456"}'},
-                {"authorization": "${gen_md5($TOKEN, $data, $random)}"}
-            ],
-            "request": {
-                "url": "http://127.0.0.1:5000/api/users/1000",
-                "METHOD": "POST",
-                "Headers": {
-                    "Content-Type": "application/json",
-                    "authorization": "$authorization",
-                    "random": "$random",
-                    "SECRET_KEY": "$SECRET_KEY"
-                },
-                "Data": "$data"
-            }
+        variables = [
+            {"TOKEN": "debugtalk"},
+            {"random": "${gen_random_string(5)}"},
+            {"data": '{"name": "user", "password": "123456"}'},
+            {"authorization": "${gen_md5($TOKEN, $data, $random)}"}
+        ]
+        self.context.update_context_variables(variables, "teststep")
+
+        request = {
+            "url": "http://127.0.0.1:5000/api/users/1000",
+            "method": "POST",
+            "headers": {
+                "Content-Type": "application/json",
+                "authorization": "$authorization",
+                "random": "$random",
+                "secret_key": "$SECRET_KEY"
+            },
+            "data": "$data"
         }
-        parsed_request = test_runner.init_config(testcase, level="testcase")
+        parsed_request = self.context.get_parsed_request(request, level="teststep")
         self.assertIn("authorization", parsed_request["headers"])
         self.assertEqual(len(parsed_request["headers"]["authorization"]), 32)
         self.assertIn("random", parsed_request["headers"])
         self.assertEqual(len(parsed_request["headers"]["random"]), 5)
         self.assertIn("data", parsed_request)
-        self.assertEqual(parsed_request["data"], testcase["variables"][2]["data"])
+        self.assertEqual(parsed_request["data"], variables[2]["data"])
         self.assertEqual(parsed_request["headers"]["secret_key"], "DebugTalk")
 
-    def test_exec_content_functions(self):
-        test_runner = runner.Runner()
-        content = "${sleep_N_secs(1)}"
-        start_time = time.time()
-        test_runner.context.eval_content(content)
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        self.assertGreater(elapsed_time, 1)
-
     def test_do_validation(self):
-        self.context.do_validation(
+        self.context._do_validation(
             {"check": "check", "check_value": 1, "expect": 1, "comparator": "eq"}
         )
-        self.context.do_validation(
+        self.context._do_validation(
             {"check": "check", "check_value": "abc", "expect": "abc", "comparator": "=="}
         )
-
-        config_dict = {
-            "path": 'tests/data/demo_testset_hardcode.yml'
-        }
-        self.context.config_context(config_dict, "testset")
-        self.context.do_validation(
+        self.context._do_validation(
             {"check": "status_code", "check_value": "201", "expect": 3, "comparator": "sum_status_code"}
         )
 
@@ -262,30 +156,29 @@ class VariableBindsUnittest(ApiServerUnittest):
         validators = [
             {"eq": ["$resp_status_code", 201]},
             {"check": "$resp_status_code", "comparator": "eq", "expect": 201},
-            {"check": "$resp_body_success", "comparator": "eq", "expect": True},
-            {"check": "${is_status_code_200($resp_status_code)}", "comparator": "eq", "expect": False}
+            {"check": "$resp_body_success", "comparator": "eq", "expect": True}
         ]
         variables = [
             {"resp_status_code": 200},
             {"resp_body_success": True}
         ]
-        self.context.bind_variables(variables)
+        self.context.update_context_variables(variables, "teststep")
 
-        with self.assertRaises(exception.ValidationError):
+        with self.assertRaises(exceptions.ValidationFailure):
             self.context.validate(validators, resp_obj)
 
+        validators = [
+            {"eq": ["$resp_status_code", 201]},
+            {"check": "$resp_status_code", "comparator": "eq", "expect": 201},
+            {"check": "$resp_body_success", "comparator": "eq", "expect": True},
+            {"check": "${is_status_code_200($resp_status_code)}", "comparator": "eq", "expect": False}
+        ]
         variables = [
             {"resp_status_code": 201},
             {"resp_body_success": True}
         ]
-        self.context.bind_variables(variables)
-        from tests.debugtalk import is_status_code_200
-        functions = {
-            "is_status_code_200": is_status_code_200
-        }
-        self.context.bind_functions(functions)
-
-        self.assertTrue(self.context.validate(validators, resp_obj))
+        self.context.update_context_variables(variables, "teststep")
+        self.context.validate(validators, resp_obj)
 
     def test_validate_exception(self):
         url = "http://127.0.0.1:5000/"
@@ -295,20 +188,19 @@ class VariableBindsUnittest(ApiServerUnittest):
         # expected value missed in validators
         validators = [
             {"eq": ["$resp_status_code", 201]},
-            {"check": "$resp_status_code", "comparator": "eq", "expect": 201},
-            {"check": "$resp_body_success", "comparator": "eq", "expect": True}
+            {"check": "$resp_status_code", "comparator": "eq", "expect": 201}
         ]
         variables = []
-        self.context.bind_variables(variables)
+        self.context.update_context_variables(variables, "teststep")
 
-        with self.assertRaises(exception.ParamsError):
+        with self.assertRaises(exceptions.VariableNotFound):
             self.context.validate(validators, resp_obj)
 
         # expected value missed in variables mapping
         variables = [
             {"resp_status_code": 200}
         ]
-        self.context.bind_variables(variables)
+        self.context.update_context_variables(variables, "teststep")
 
-        with self.assertRaises(exception.ValidationError):
+        with self.assertRaises(exceptions.ValidationFailure):
             self.context.validate(validators, resp_obj)

@@ -8,11 +8,10 @@ import unittest
 
 from httprunner import logger
 from httprunner.__about__ import __description__, __version__
+from httprunner.api import HttpRunner
 from httprunner.compat import is_py2
-from httprunner.task import HttpRunner
 from httprunner.utils import (create_scaffold, get_python2_retire_msg,
-                              prettify_json_file, print_output,
-                              validate_json_file)
+                              prettify_json_file, validate_json_file)
 
 
 def main_hrun():
@@ -42,7 +41,7 @@ def main_hrun():
         help="Write logs to specified file path.")
     parser.add_argument(
         '--dot-env-path',
-        help="Specify .env file path, which is useful for keeping production credentials.")
+        help="Specify .env file path, which is useful for keeping sensitive data.")
     parser.add_argument(
         '--failfast', action='store_true', default=False,
         help="Stop the test run on the first error or failure.")
@@ -75,11 +74,18 @@ def main_hrun():
 
     project_name = args.startproject
     if project_name:
-        project_path = os.path.join(os.getcwd(), project_name)
-        create_scaffold(project_path)
+        create_scaffold(project_name)
         exit(0)
 
-    runner = HttpRunner(failfast=args.failfast, dot_env_path=args.dot_env_path).run(args.testset_paths)
+    try:
+        runner = HttpRunner(
+            failfast=args.failfast,
+            dot_env_path=args.dot_env_path
+        )
+        runner.run(args.testset_paths)
+    except Exception:
+        logger.log_error("!!!!!!!!!! exception stage: {} !!!!!!!!!!".format(runner.exception_stage))
+        raise
 
     if not args.no_html_report:
         runner.gen_html_report(
@@ -88,7 +94,6 @@ def main_hrun():
         )
 
     summary = runner.summary
-    print_output(summary["output"])
     return 0 if summary["success"] else 1
 
 def main_locust():

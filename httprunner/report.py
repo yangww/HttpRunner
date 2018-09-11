@@ -6,14 +6,13 @@ import platform
 import time
 import unittest
 from base64 import b64encode
-from collections import Iterable, OrderedDict
+from collections import Iterable
 from datetime import datetime
 
-from httprunner import logger
+from httprunner import loader, logger
 from httprunner.__about__ import __version__
 from httprunner.compat import basestring, bytes, json, numeric_types
 from jinja2 import Template, escape
-from requests.structures import CaseInsensitiveDict
 
 
 def get_platform():
@@ -25,6 +24,7 @@ def get_platform():
         ),
         "platform": platform.platform()
     }
+
 
 def get_summary(result):
     """ get summary from test result
@@ -38,8 +38,7 @@ def get_summary(result):
             'skipped': len(result.skipped),
             'expectedFailures': len(result.expectedFailures),
             'unexpectedSuccesses': len(result.unexpectedSuccesses)
-        },
-        "platform": get_platform()
+        }
     }
     summary["stat"]["successes"] = summary["stat"]["testsRun"] \
         - summary["stat"]["failures"] \
@@ -50,7 +49,7 @@ def get_summary(result):
 
     if getattr(result, "records", None):
         summary["time"] = {
-            'start_at': datetime.fromtimestamp(result.start_at),
+            'start_at': result.start_at,
             'duration': result.duration
         }
         summary["records"] = result.records
@@ -58,6 +57,25 @@ def get_summary(result):
         summary["records"] = []
 
     return summary
+
+
+def aggregate_stat(origin_stat, new_stat):
+    """ aggregate new_stat to origin_stat.
+
+    Args:
+        origin_stat (dict): origin stat dict, will be updated with new_stat dict.
+        new_stat (dict): new stat dict.
+
+    """
+    for key in new_stat:
+        if key not in origin_stat:
+            origin_stat[key] = new_stat[key]
+        elif key == "start_at":
+            # start datetime
+            origin_stat[key] = min(origin_stat[key], new_stat[key])
+        else:
+            origin_stat[key] += new_stat[key]
+
 
 def render_html_report(summary, html_report_name=None, html_report_template=None):
     """ render html report with specified report name and template
@@ -68,7 +86,7 @@ def render_html_report(summary, html_report_name=None, html_report_template=None
         html_report_template = os.path.join(
             os.path.abspath(os.path.dirname(__file__)),
             "templates",
-            "default_report_template.html"
+            "report_template.html"
         )
         logger.log_debug("No html report template specified, use default.")
     else:
@@ -77,64 +95,81 @@ def render_html_report(summary, html_report_name=None, html_report_template=None
     logger.log_info("Start to render Html report ...")
     logger.log_debug("render data: {}".format(summary))
 
-    report_dir_path = os.path.join(os.getcwd(), "reports")
-    start_datetime = summary["time"]["start_at"].strftime('%Y-%m-%d-%H-%M-%S')
+    report_dir_path = os.path.join(loader.project_working_directory, "reports")
+    start_at_timestamp = int(summary["time"]["start_at"])
+    summary["time"]["start_datetime"] = datetime.fromtimestamp(start_at_timestamp).strftime('%Y-%m-%d %H:%M:%S')
     if html_report_name:
         summary["html_report_name"] = html_report_name
         report_dir_path = os.path.join(report_dir_path, html_report_name)
-        html_report_name += "-{}.html".format(start_datetime)
+        html_report_name += "-{}.html".format(start_at_timestamp)
     else:
         summary["html_report_name"] = ""
-        html_report_name = "{}.html".format(start_datetime)
+        html_report_name = "{}.html".format(start_at_timestamp)
 
     if not os.path.isdir(report_dir_path):
         os.makedirs(report_dir_path)
 
-    for record in summary.get("records"):
-        meta_data = record['meta_data']
-        stringify_body(meta_data, 'request')
-        stringify_body(meta_data, 'response')
+    for index, suite_summary in enumerate(summary["details"]):
+        if not suite_summary.get("name"):
+            suite_summary["name"] = "test suite {}".format(index)
+        for record in suite_summary.get("records"):
+            meta_data = record['meta_data']
+            stringify_data(meta_data, 'request')
+            stringify_data(meta_data, 'response')
 
     with io.open(html_report_template, "r", encoding='utf-8') as fp_r:
         template_content = fp_r.read()
         report_path = os.path.join(report_dir_path, html_report_name)
         with io.open(report_path, 'w', encoding='utf-8') as fp_w:
-            rendered_content = Template(template_content).render(summary)
+            rendered_content = Template(
+                template_content,
+                extensions=["jinja2.ext.loopcontrols"]
+            ).render(summary)
             fp_w.write(rendered_content)
 
     logger.log_info("Generated Html report: {}".format(report_path))
 
     return report_path
 
-def stringify_body(meta_data, request_or_response):
-    headers = meta_data['{}_headers'.format(request_or_response)]
-    body = meta_data.get('{}_body'.format(request_or_response))
 
-    if isinstance(body, CaseInsensitiveDict):
-        body = json.dumps(dict(body), ensure_ascii=False)
+def stringify_data(meta_data, request_or_response):
+    """
+    meta_data = {
+        "request": {},
+        "response": {}
+    }
+    """
+    headers = meta_data[request_or_response]["headers"]
+    request_or_response_dict = meta_data[request_or_response]
 
-    elif isinstance(body, (dict, list)):
-        body = json.dumps(body, indent=2, ensure_ascii=False)
+    for key, value in request_or_response_dict.items():
 
-    elif isinstance(body, bytes):
-        resp_content_type = headers.get("Content-Type", "")
-        try:
-            if "image" in resp_content_type:
-                meta_data["response_data_type"] = "image"
-                body = "data:{};base64,{}".format(
-                    resp_content_type,
-                    b64encode(body).decode('utf-8')
-                )
-            else:
-                body = escape(body.decode("utf-8"))
-        except UnicodeDecodeError:
-            pass
+        if isinstance(value, list):
+            value = json.dumps(value, indent=2, ensure_ascii=False)
 
-    elif not isinstance(body, (basestring, numeric_types, Iterable)):
-        # class instance, e.g. MultipartEncoder()
-        body = repr(body)
+        elif isinstance(value, bytes):
+            try:
+                encoding = meta_data["response"].get("encoding")
+                if not encoding or encoding == "None":
+                    encoding = "utf-8"
 
-    meta_data['{}_body'.format(request_or_response)] = body
+                if request_or_response == "response" and key == "content" \
+                    and "image" in meta_data["response"]["content_type"]:
+                    # display image
+                    value = "data:{};base64,{}".format(
+                        meta_data["response"]["content_type"],
+                        b64encode(value).decode(encoding)
+                    )
+                else:
+                    value = escape(value.decode(encoding))
+            except UnicodeDecodeError:
+                pass
+
+        elif not isinstance(value, (basestring, numeric_types, Iterable)):
+            # class instance, e.g. MultipartEncoder()
+            value = repr(value)
+
+        meta_data[request_or_response][key] = value
 
 
 class HtmlTestResult(unittest.TextTestResult):
@@ -147,12 +182,16 @@ class HtmlTestResult(unittest.TextTestResult):
         self.records = []
 
     def _record_test(self, test, status, attachment=''):
-        self.records.append({
+        data = {
             'name': test.shortDescription(),
             'status': status,
             'attachment': attachment,
-            "meta_data": test.meta_data
-        })
+            "meta_data": {}
+        }
+        if hasattr(test, "meta_data"):
+            data["meta_data"] = test.meta_data
+
+        self.records.append(data)
 
     def startTestRun(self):
         self.start_at = time.time()

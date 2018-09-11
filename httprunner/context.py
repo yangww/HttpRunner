@@ -1,191 +1,145 @@
 # encoding: utf-8
 
 import copy
-import os
-import re
-import sys
 
-from httprunner import exception, testcase, utils
+from httprunner import exceptions, logger, parser, utils
 from httprunner.compat import OrderedDict
 
 
 class Context(object):
     """ Manages context functions and variables.
-        context has two levels, testset and testcase.
+        context has two levels, testcase and teststep.
     """
-    def __init__(self):
-        self.testset_shared_variables_mapping = OrderedDict()
-        self.testcase_variables_mapping = OrderedDict()
-        self.testcase_parser = testcase.TestcaseParser()
-        self.init_context()
-
-    def init_context(self, level='testset'):
+    def __init__(self, variables=None, functions=None):
+        """ init Context with testcase variables and functions.
         """
-        testset level context initializes when a file is loaded,
-        testcase level context initializes when each testcase starts.
+        # testcase level context
+        ## TESTCASE_SHARED_VARIABLES_MAPPING and TESTCASE_SHARED_FUNCTIONS_MAPPING will not change.
+        self.TESTCASE_SHARED_VARIABLES_MAPPING = variables or OrderedDict()
+        self.TESTCASE_SHARED_FUNCTIONS_MAPPING = functions or OrderedDict()
+
+        # testcase level request, will not change
+        self.TESTCASE_SHARED_REQUEST_MAPPING = {}
+
+        self.evaluated_validators = []
+        self.init_context_variables(level="testcase")
+
+    def init_context_variables(self, level="testcase"):
+        """ initialize testcase/teststep context
+
+        Args:
+            level (enum): "testcase" or "teststep"
+
         """
-        if level == "testset":
-            self.testset_functions_config = {}
-            self.testset_request_config = {}
-            self.testset_shared_variables_mapping = OrderedDict()
+        if level == "testcase":
+            # testcase level runtime context, will be updated with extracted variables in each teststep.
+            self.testcase_runtime_variables_mapping = copy.deepcopy(self.TESTCASE_SHARED_VARIABLES_MAPPING)
 
-        # testcase config shall inherit from testset configs,
-        # but can not change testset configs, that's why we use copy.deepcopy here.
-        self.testcase_functions_config = copy.deepcopy(self.testset_functions_config)
-        self.testcase_variables_mapping = copy.deepcopy(self.testset_shared_variables_mapping)
+        # teststep level context, will be altered in each teststep.
+        # teststep config shall inherit from testcase configs,
+        # but can not change testcase configs, that's why we use copy.deepcopy here.
+        self.teststep_variables_mapping = copy.deepcopy(self.testcase_runtime_variables_mapping)
 
-        self.testcase_parser.bind_functions(self.testcase_functions_config)
-        self.testcase_parser.update_binded_variables(self.testcase_variables_mapping)
+    def update_context_variables(self, variables, level):
+        """ update context variables, with level specified.
 
-        if level == "testset":
-            self.import_module_items(["httprunner.built_in"], "testset")
+        Args:
+            variables (list/OrderedDict): testcase config block or teststep block
+                [
+                    {"TOKEN": "debugtalk"},
+                    {"random": "${gen_random_string(5)}"},
+                    {"json": {'name': 'user', 'password': '123456'}},
+                    {"md5": "${gen_md5($TOKEN, $json, $random)}"}
+                ]
+                OrderDict({
+                    "TOKEN": "debugtalk",
+                    "random": "${gen_random_string(5)}",
+                    "json": {'name': 'user', 'password': '123456'},
+                    "md5": "${gen_md5($TOKEN, $json, $random)}"
+                })
+            level (enum): "testcase" or "teststep"
 
-    def config_context(self, config_dict, level):
-        if level == "testset":
-            self.testcase_parser.file_path = config_dict.get("path", None)
-
-        requires = config_dict.get('requires', [])
-        self.import_requires(requires)
-
-        function_binds = config_dict.get('function_binds', {})
-        self.bind_functions(function_binds, level)
-
-        # import_module_functions will be deprecated soon
-        module_items = config_dict.get('import_module_items', []) \
-            or config_dict.get('import_module_functions', [])
-        self.import_module_items(module_items, level)
-
-        variables = config_dict.get('variables') \
-            or config_dict.get('variable_binds', OrderedDict())
-        self.bind_variables(variables, level)
-
-    def import_requires(self, modules):
-        """ import required modules dynamically
-        """
-        for module_name in modules:
-            globals()[module_name] = utils.get_imported_module(module_name)
-
-    def bind_functions(self, function_binds, level="testcase"):
-        """ Bind named functions within the context
-            This allows for passing in self-defined functions in testing.
-            e.g. function_binds:
-            {
-                "add_one": lambda x: x + 1,             # lambda function
-                "add_two_nums": "lambda x, y: x + y"    # lambda function in string
-            }
-        """
-        eval_function_binds = {}
-        for func_name, function in function_binds.items():
-            if isinstance(function, str):
-                function = eval(function)
-            eval_function_binds[func_name] = function
-
-        self.__update_context_functions_config(level, eval_function_binds)
-
-    def import_module_items(self, modules, level="testcase"):
-        """ import modules and bind all functions within the context
-        """
-        sys.path.insert(0, os.getcwd())
-        for module_name in modules:
-            imported_module = utils.get_imported_module(module_name)
-            imported_functions_dict = utils.filter_module(imported_module, "function")
-            self.__update_context_functions_config(level, imported_functions_dict)
-
-            imported_variables_dict = utils.filter_module(imported_module, "variable")
-            self.bind_variables(imported_variables_dict, level)
-
-    def bind_variables(self, variables, level="testcase"):
-        """ bind variables to testset context or current testcase context.
-            variables in testset context can be used in all testcases of current test suite.
-
-        @param (list or OrderDict) variables, variable can be value or custom function.
-            if value is function, it will be called and bind result to variable.
-        e.g.
-            OrderDict({
-                "TOKEN": "debugtalk",
-                "random": "${gen_random_string(5)}",
-                "json": {'name': 'user', 'password': '123456'},
-                "md5": "${gen_md5($TOKEN, $json, $random)}"
-            })
         """
         if isinstance(variables, list):
-            variables = utils.convert_to_order_dict(variables)
+            variables = utils.convert_mappinglist_to_orderdict(variables)
 
-        for variable_name, value in variables.items():
-            variable_eval_value = self.eval_content(value)
+        for variable_name, variable_value in variables.items():
+            variable_eval_value = self.eval_content(variable_value)
 
-            if level == "testset":
-                self.testset_shared_variables_mapping[variable_name] = variable_eval_value
+            if level == "testcase":
+                self.testcase_runtime_variables_mapping[variable_name] = variable_eval_value
 
-            self.bind_testcase_variable(variable_name, variable_eval_value)
-
-    def bind_testcase_variable(self, variable_name, variable_value):
-        """ bind and update testcase variables mapping
-        """
-        self.testcase_variables_mapping[variable_name] = variable_value
-        self.testcase_parser.update_binded_variables(self.testcase_variables_mapping)
-
-    def bind_extracted_variables(self, variables):
-        """ bind extracted variables to testset context
-        @param (OrderDict) variables
-            extracted value do not need to evaluate.
-        """
-        for variable_name, value in variables.items():
-            self.testset_shared_variables_mapping[variable_name] = value
-            self.bind_testcase_variable(variable_name, value)
-
-    def __update_context_functions_config(self, level, config_mapping):
-        """
-        @param level: testset or testcase
-        @param config_type: functions
-        @param config_mapping: functions config mapping
-        """
-        if level == "testset":
-            self.testset_functions_config.update(config_mapping)
-
-        self.testcase_functions_config.update(config_mapping)
-        self.testcase_parser.bind_functions(self.testcase_functions_config)
+            self.update_teststep_variables_mapping(variable_name, variable_eval_value)
 
     def eval_content(self, content):
         """ evaluate content recursively, take effect on each variable and function in content.
             content may be in any data structure, include dict, list, tuple, number, string, etc.
         """
-        return self.testcase_parser.eval_content_with_bindings(content)
+        return parser.parse_data(
+            content,
+            self.teststep_variables_mapping,
+            self.TESTCASE_SHARED_FUNCTIONS_MAPPING
+        )
 
-    def get_parsed_request(self, request_dict, level="testcase"):
-        """ get parsed request with bind variables and functions.
-        @param request_dict: request config mapping
-        @param level: testset or testcase
+    def update_testcase_runtime_variables_mapping(self, variables):
+        """ update testcase_runtime_variables_mapping with extracted vairables in teststep.
+
+        Args:
+            variables (OrderDict): extracted variables in teststep
+
         """
-        if level == "testset":
-            request_dict = self.eval_content(
-                request_dict
+        for variable_name, variable_value in variables.items():
+            self.testcase_runtime_variables_mapping[variable_name] = variable_value
+            self.update_teststep_variables_mapping(variable_name, variable_value)
+
+    def update_teststep_variables_mapping(self, variable_name, variable_value):
+        """ bind and update testcase variables mapping
+        """
+        self.teststep_variables_mapping[variable_name] = variable_value
+
+    def get_parsed_request(self, request_dict, level="teststep"):
+        """ get parsed request with variables and functions.
+
+        Args:
+            request_dict (dict): request config mapping
+            level (enum): "testcase" or "teststep"
+
+        Returns:
+            dict: parsed request dict
+
+        """
+        if level == "testcase":
+            # testcase config request dict has been parsed in parse_tests
+            self.TESTCASE_SHARED_REQUEST_MAPPING = copy.deepcopy(request_dict)
+            return self.TESTCASE_SHARED_REQUEST_MAPPING
+
+        else:
+            # teststep
+            return self.eval_content(
+                utils.deep_update_dict(
+                    copy.deepcopy(self.TESTCASE_SHARED_REQUEST_MAPPING),
+                    request_dict
+                )
             )
-            self.testset_request_config.update(request_dict)
 
-        testcase_request_config = utils.deep_update_dict(
-            copy.deepcopy(self.testset_request_config),
-            request_dict
-        )
-        parsed_request = self.eval_content(
-            testcase_request_config
-        )
+    def __eval_check_item(self, validator, resp_obj):
+        """ evaluate check item in validator.
 
-        return parsed_request
+        Args:
+            validator (dict): validator
+                {"check": "status_code", "comparator": "eq", "expect": 201}
+                {"check": "$resp_body_success", "comparator": "eq", "expect": True}
+            resp_obj (object): requests.Response() object
 
-    def eval_check_item(self, validator, resp_obj):
-        """ evaluate check item in validator
-        @param (dict) validator
-            {"check": "status_code", "comparator": "eq", "expect": 201}
-            {"check": "$resp_body_success", "comparator": "eq", "expect": True}
-        @param (object) resp_obj
-        @return (dict) validator info
-            {
-                "check": "status_code",
-                "check_value": 200,
-                "expect": 201,
-                "comparator": "eq"
-            }
+        Returns:
+            dict: validator info
+                {
+                    "check": "status_code",
+                    "check_value": 200,
+                    "expect": 201,
+                    "comparator": "eq"
+                }
+
         """
         check_item = validator["check"]
         # check_item should only be the following 5 formats:
@@ -196,18 +150,13 @@ class Context(object):
         # 5, regex string, e.g. "LB[\d]*(.*)RB[\d]*"
 
         if isinstance(check_item, (dict, list)) \
-            or testcase.extract_variables(check_item) \
-            or testcase.extract_functions(check_item):
+            or parser.extract_variables(check_item) \
+            or parser.extract_functions(check_item):
             # format 1/2/3
             check_value = self.eval_content(check_item)
         else:
-            try:
-                # format 4/5
-                check_value = resp_obj.extract_field(check_item)
-            except exception.ParseResponseError:
-                msg = "failed to extract check item from response!\n"
-                msg += "response content: {}".format(resp_obj.content)
-                raise exception.ParseResponseError(msg)
+            # format 4/5
+            check_value = resp_obj.extract_field(check_item)
 
         validator["check_value"] = check_value
 
@@ -216,17 +165,28 @@ class Context(object):
         # 2, actual value, e.g. 200
         expect_value = self.eval_content(validator["expect"])
         validator["expect"] = expect_value
+        validator["check_result"] = "unchecked"
         return validator
 
-    def do_validation(self, validator_dict):
+    def _do_validation(self, validator_dict):
         """ validate with functions
+
+        Args:
+            validator_dict (dict): validator dict
+                {
+                    "check": "status_code",
+                    "check_value": 200,
+                    "expect": 201,
+                    "comparator": "eq"
+                }
+
         """
-        # TODO: move comparator uniform to init_task_suite
+        # TODO: move comparator uniform to init_test_suites
         comparator = utils.get_uniform_comparator(validator_dict["comparator"])
-        validate_func = self.testcase_parser.get_bind_function(comparator)
+        validate_func = self.TESTCASE_SHARED_FUNCTIONS_MAPPING.get(comparator)
 
         if not validate_func:
-            raise exception.FunctionNotFound("comparator not found: {}".format(comparator))
+            raise exceptions.FunctionNotFound("comparator not found: {}".format(comparator))
 
         check_item = validator_dict["check"]
         check_value = validator_dict["check_value"]
@@ -234,29 +194,61 @@ class Context(object):
 
         if (check_value is None or expect_value is None) \
             and comparator not in ["is", "eq", "equals", "=="]:
-            raise exception.ParamsError("Null value can only be compared with comparator: eq/equals/==")
+            raise exceptions.ParamsError("Null value can only be compared with comparator: eq/equals/==")
+
+        validate_msg = "validate: {} {} {}({})".format(
+            check_item,
+            comparator,
+            expect_value,
+            type(expect_value).__name__
+        )
 
         try:
-            validate_func(validator_dict["check_value"], validator_dict["expect"])
+            validator_dict["check_result"] = "pass"
+            validate_func(check_value, expect_value)
+            validate_msg += "\t==> pass"
+            logger.log_debug(validate_msg)
         except (AssertionError, TypeError):
-            err_msg = "\n" + "\n".join([
-                "\tcheck item name: %s;" % check_item,
-                "\tcheck item value: %s (%s);" % (check_value, type(check_value).__name__),
-                "\tcomparator: %s;" % comparator,
-                "\texpected value: %s (%s)." % (expect_value, type(expect_value).__name__)
-            ])
-            raise exception.ValidationError(err_msg)
+            validate_msg += "\t==> fail"
+            validate_msg += "\n{}({}) {} {}({})".format(
+                check_value,
+                type(check_value).__name__,
+                comparator,
+                expect_value,
+                type(expect_value).__name__
+            )
+            logger.log_error(validate_msg)
+            validator_dict["check_result"] = "fail"
+            raise exceptions.ValidationFailure(validate_msg)
 
     def validate(self, validators, resp_obj):
-        """ check validators with the context variable mapping.
-        @param (list) validators
-        @param (object) resp_obj
+        """ make validations
         """
+        evaluated_validators = []
+        if not validators:
+            return evaluated_validators
+
+        logger.log_info("start to validate.")
+        validate_pass = True
+        failures = []
+
         for validator in validators:
-            validator_dict = self.eval_check_item(
-                testcase.parse_validator(validator),
+            # evaluate validators with context variable mapping.
+            evaluated_validator = self.__eval_check_item(
+                parser.parse_validator(validator),
                 resp_obj
             )
-            self.do_validation(validator_dict)
 
-        return True
+            try:
+                self._do_validation(evaluated_validator)
+            except exceptions.ValidationFailure as ex:
+                validate_pass = False
+                failures.append(str(ex))
+
+            evaluated_validators.append(evaluated_validator)
+
+        if not validate_pass:
+            failures_string = "\n".join([failure for failure in failures])
+            raise exceptions.ValidationFailure(failures_string)
+
+        return evaluated_validators

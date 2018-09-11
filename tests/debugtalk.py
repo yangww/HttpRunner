@@ -1,32 +1,24 @@
-import hashlib
-import hmac
 import json
 import os
 import random
 import string
 import time
 
-try:
-    import urllib
-except NameError:
-    import urllib.parse as urllib
+from tests.api_server import HTTPBIN_SERVER, SECRET_KEY, gen_md5, get_sign
 
-SECRET_KEY = "DebugTalk"
 BASE_URL = "http://127.0.0.1:5000"
+UserName = os.environ['UserName']
 
-def get_sign(*args):
-    content = ''.join(args).encode('ascii')
-    sign_key = SECRET_KEY.encode('ascii')
-    sign = hmac.new(sign_key, content, hashlib.sha1).hexdigest()
-    return sign
 
-get_sign_lambda = lambda *args: hmac.new(
-    'DebugTalk'.encode('ascii'),
-    ''.join(args).encode('ascii'),
-    hashlib.sha1).hexdigest()
+demo_default_request = {
+    "base_url": "$BASE_URL",
+    "headers": {
+        "content-type": "application/json"
+    }
+}
 
-def gen_md5(*args):
-    return hashlib.md5("".join(args).encode('utf-8')).hexdigest()
+def sum_two(m, n):
+    return m + n
 
 def sum_status_code(status_code, expect_sum):
     """ sum status code digits
@@ -59,8 +51,6 @@ def get_account():
         {"username": "user1", "password": "111111"},
         {"username": "user2", "password": "222222"}
     ]
-
-SECRET_KEY = "DebugTalk"
 
 def gen_random_string(str_len):
     random_char_list = []
@@ -102,3 +92,11 @@ def alter_response(response):
     response.status_code = 500
     response.headers["Content-Type"] = "html/text"
     response.json["headers"]["Host"] = "127.0.0.1:8888"
+    response.new_attribute = "new_attribute_value"
+    response.new_attribute_dict = {
+        "key": 123
+    }
+
+def alter_response_error(response):
+    # NameError
+    not_defined_variable
